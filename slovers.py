@@ -2,7 +2,13 @@ import argparse
 import os
 import time
 
-from benchmark_utils import read_board_sizes, save_results
+from benchmark_utils import (
+    TIME_LIMIT_SECONDS,
+    read_board_sizes,
+    read_terminal_statuses,
+    run_with_timeout,
+    save_results,
+)
 
 def valid(board, n):
     if n < 1 or board is None or len(board) != n:
@@ -11,6 +17,15 @@ def valid(board, n):
             and len(set(board)) == n
             and len({board[r] + r for r in range(n)}) == n
             and len({board[r] - r for r in range(n)}) == n)
+
+
+def _normalize_status(status, valid_solution, infeasible):
+    if valid_solution:
+        return "SAT"
+    if infeasible:
+        return "UNSAT"
+    return status
+
 
 def solve_cpsat(n):
     from ortools.sat.python import cp_model
@@ -46,13 +61,19 @@ def solve_cpsat(n):
         board = None
         valid_solution = False
 
+    status = _normalize_status(
+        status,
+        valid_solution,
+        status_code == cp_model.INFEASIBLE,
+    )
+
     return {
     "status": status,
     "board": board,
     "runtime_seconds": runtime,
     "valid_solution": valid_solution,
     "variables": n,
-    "clauses": None,
+    "clauses": 0,
     "encoding_time": encoding_time,
     "solve_time": solve_time,
     }
@@ -104,6 +125,11 @@ def solve_cplex_cp(n):
             valid_solution = False
             status = "NO_VALID_SOLUTION"
 
+    status = _normalize_status(
+        status,
+        valid_solution,
+        "infeasible" in status.lower(),
+    )
 
     return {
     "status": status,
@@ -111,7 +137,7 @@ def solve_cplex_cp(n):
     "runtime_seconds": runtime,
     "valid_solution": valid_solution,
     "variables": n,
-    "clauses": None,
+    "clauses": 0,
     "encoding_time": encoding_time,
     "solve_time": solve_time,
     }
@@ -209,6 +235,11 @@ def solve_cplex_mip(n):
             board.append(cols[0])
 
     valid_solution = board is not None and valid(board, n)
+    status = _normalize_status(
+        status,
+        valid_solution,
+        "infeasible" in status.lower(),
+    )
     model.end()
 
     return {
@@ -217,7 +248,7 @@ def solve_cplex_mip(n):
     "runtime_seconds": runtime,
     "valid_solution": valid_solution,
     "variables": n * n,
-    "clauses": None,
+    "clauses": 0,
     "encoding_time": encoding_time,
     "solve_time": solve_time,
     }
@@ -325,13 +356,19 @@ def _solve_gurobi_model(gp, GRB, n, env=None):
                 if not valid_solution:
                     board = None
 
+        status = _normalize_status(
+            status,
+            valid_solution,
+            model.Status == GRB.INFEASIBLE,
+        )
+
         return {
         "status": status,
         "board": board,
         "runtime_seconds": runtime,
         "valid_solution": valid_solution,
         "variables": n * n,
-        "clauses": None,
+        "clauses": 0,
         "encoding_time": encoding_time,
         "solve_time": solve_time,
         }
@@ -377,8 +414,12 @@ def main():
         SOLVERS if args.solver == "all"
         else {args.solver: SOLVERS[args.solver]}
     )
-
     rows = []
+    existing_terminal_statuses = {
+        name: read_terminal_statuses(name)
+        for name in chosen
+    }
+    terminal_status_by_solver = {}
 
     for n in sizes:
         if n < 1:
@@ -387,6 +428,29 @@ def main():
         print(f"\nProcessing N={n}...", flush=True)
 
         for name, solver_func in chosen.items():
+            terminal_status = terminal_status_by_solver.get(name)
+            if terminal_status is None:
+                terminal_status = existing_terminal_statuses[name].get(n)
+                if terminal_status is not None:
+                    terminal_status_by_solver[name] = terminal_status
+                    continue
+
+            if terminal_status is not None:
+                row = {
+                    "N": n,
+                    "Encoding": name,
+                    "Variables": "",
+                    "Clauses": "",
+                    "EncodingTime": "",
+                    "SolveTime": "",
+                    "TotalTime": "",
+                    "Status": terminal_status,
+                }
+                rows.append(row)
+                save_results(rows)
+                print(row, flush=True)
+                continue
+
             max_size = SOLVER_MAX_SIZES.get(name)
             if max_size is not None and n > max_size:
                 row = {
@@ -397,15 +461,36 @@ def main():
                     "EncodingTime": "",
                     "SolveTime": "",
                     "TotalTime": "",
-                    "Status": f"SKIPPED: max N={max_size}",
+                    "Status": "SKIPPED",
                 }
                 rows.append(row)
                 save_results(rows)
                 print(row, flush=True)
+                terminal_status_by_solver[name] = "SKIPPED"
                 continue
 
             try:
-                result = solver_func(n)
+                result, wall_time, timed_out = run_with_timeout(
+                    solver_func,
+                    (n,),
+                )
+                timed_out = timed_out or wall_time >= TIME_LIMIT_SECONDS
+                if timed_out:
+                    row = {
+                        "N": n,
+                        "Encoding": name,
+                        "Variables": "",
+                        "Clauses": "",
+                        "EncodingTime": "",
+                        "SolveTime": "",
+                        "TotalTime": f"{TIME_LIMIT_SECONDS:.6f}",
+                        "Status": f"TIMEOUT:{TIME_LIMIT_SECONDS}s",
+                    }
+                    rows.append(row)
+                    save_results(rows)
+                    print(row, flush=True)
+                    terminal_status_by_solver[name] = row["Status"]
+                    continue
 
                 encoding_time = result.get("encoding_time")
                 solve_time = result.get("solve_time")
@@ -416,17 +501,22 @@ def main():
                 if encoding_time is None:
                     encoding_time = 0.0
 
-                total_time = encoding_time + solve_time
+                total_time = wall_time
+                status = result["status"]
+                clauses = (
+                    "" if status.startswith(("ERROR", "SKIPPED"))
+                    else result.get("clauses", 0)
+                )
 
                 row = {
                     "N": n,
                     "Encoding": name,
                     "Variables": result.get("variables", ""),
-                    "Clauses": result.get("clauses", ""),
+                    "Clauses": clauses,
                     "EncodingTime": f"{encoding_time:.6f}",
                     "SolveTime": f"{solve_time:.6f}",
                     "TotalTime": f"{total_time:.6f}",
-                    "Status": result["status"],
+                    "Status": status,
                 }
                 rows.append(row)
 
